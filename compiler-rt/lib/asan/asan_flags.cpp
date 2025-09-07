@@ -276,6 +276,20 @@ void InitializeFlags() {
 
 }  // namespace __asan
 
+static bool user_state_detection_enabled = false;
+
+namespace __asan {
+
+void SetUserStateDetectionEnabled(bool enabled) {
+    user_state_detection_enabled = enabled;
+}
+
+bool ShouldCheckUserState() {
+    return flags()->user_state_detection && user_state_detection_enabled;
+}
+
+}  // namespace __asan
+
 SANITIZER_INTERFACE_WEAK_DEF(const char*, __asan_default_options, void) {
   return "";
 }

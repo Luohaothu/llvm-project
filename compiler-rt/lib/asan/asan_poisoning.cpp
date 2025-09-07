@@ -133,6 +133,24 @@ void AsanPoisonOrUnpoisonIntraObjectRedzone(uptr ptr, uptr size, bool poison) {
     *(u8*)MemToShadow(ptr) = poison ? kAsanIntraObjectRedzone : 0;
 }
 
+// User state encoding/decoding functions
+u8 encode_user_state_to_shadow(asan_user_state_t state) {
+    return ASAN_USER_STATE_SHADOW_BASE + ((u8)state & 0x1F);
+}
+
+asan_user_state_t decode_user_state_from_shadow(u8 shadow_value) {
+    if (shadow_value < ASAN_USER_STATE_SHADOW_BASE || 
+        shadow_value > ASAN_USER_STATE_SHADOW_MAX) {
+        return (asan_user_state_t)0;
+    }
+    return (asan_user_state_t)(shadow_value - ASAN_USER_STATE_SHADOW_BASE);
+}
+
+bool is_user_state_shadow(u8 shadow_value) {
+    return shadow_value >= ASAN_USER_STATE_SHADOW_BASE && 
+           shadow_value <= ASAN_USER_STATE_SHADOW_MAX;
+}
+
 }  // namespace __asan
 
 // ---------------------- Interface ---------------- {{{1

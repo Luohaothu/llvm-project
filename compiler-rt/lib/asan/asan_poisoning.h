@@ -20,6 +20,22 @@
 #include "sanitizer_common/sanitizer_flags.h"
 #include "sanitizer_common/sanitizer_platform.h"
 
+// Forward declarations to avoid header conflicts
+typedef enum {
+    ASAN_USER_ALLOCATED = 0x01,    // 0=destroyed, 1=allocated
+    ASAN_USER_STATE_INITIALIZED = 0x02,  // 0=uninitialized, 1=initialized
+    ASAN_USER_RESERVED = 0x04,      // 0=not recycled, 1=recycled
+    ASAN_USER_WRITABLE = 0x08,      // 0=read-only, 1=writable
+    ASAN_USER_STATE_TRACKED = 0x10, // 0=not tracked, 1=tracked
+    ASAN_USER_STATE_RESERVED1 = 0x20,
+    ASAN_USER_STATE_RESERVED2 = 0x40,
+    ASAN_USER_STATE_RESERVED3 = 0x80
+} asan_user_state_t;
+
+// User state shadow memory mapping
+#define ASAN_USER_STATE_SHADOW_BASE 0x80
+#define ASAN_USER_STATE_SHADOW_MAX 0x9F
+
 namespace __asan {
 
 struct PoisonRecord {
@@ -110,6 +126,11 @@ ALWAYS_INLINE void FastPoisonShadowPartialRightRedzone(
 // Calls __sanitizer::ReleaseMemoryPagesToOS() on
 // [MemToShadow(p), MemToShadow(p+size)].
 void FlushUnneededASanShadowMemory(uptr p, uptr size);
+
+// User state encoding/decoding functions
+u8 encode_user_state_to_shadow(asan_user_state_t state);
+asan_user_state_t decode_user_state_from_shadow(u8 shadow_value);
+bool is_user_state_shadow(u8 shadow_value);
 
 }  // namespace __asan
 

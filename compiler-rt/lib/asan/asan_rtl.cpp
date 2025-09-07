@@ -33,6 +33,25 @@
 #include "ubsan/ubsan_init.h"
 #include "ubsan/ubsan_platform.h"
 
+// Include for size_t
+#include <stddef.h>
+
+// Define the user state macros that are in the interface header
+#define ASAN_IS_ALLOCATED(state) ((state) & ASAN_USER_ALLOCATED)
+#define ASAN_IS_DESTROYED(state) (!((state) & ASAN_USER_ALLOCATED))
+#define ASAN_IS_INITIALIZED(state) ((state) & ASAN_USER_STATE_INITIALIZED)
+#define ASAN_IS_RECYCLED(state) ((state) & ASAN_USER_RESERVED)
+#define ASAN_IS_WRITABLE(state) ((state) & ASAN_USER_WRITABLE)
+#define ASAN_IS_READONLY(state) (!((state) & ASAN_USER_WRITABLE))
+#define ASAN_IS_TRACKED(state) ((state) & ASAN_USER_STATE_TRACKED)
+
+#define ASAN_SET_INITIALIZED(state) ((state) = (asan_user_state_t)((state) | ASAN_USER_STATE_INITIALIZED))
+#define ASAN_SET_RECYCLED(state) ((state) = (asan_user_state_t)((state) | ASAN_USER_RESERVED))
+#define ASAN_SET_WRITABLE(state) ((state) = (asan_user_state_t)((state) | ASAN_USER_WRITABLE))
+#define ASAN_SET_READONLY(state) ((state) = (asan_user_state_t)((state) & ~ASAN_USER_WRITABLE))
+#define ASAN_SET_TRACKED(state) ((state) = (asan_user_state_t)((state) | ASAN_USER_STATE_TRACKED))
+#define ASAN_SET_NOT_TRACKED(state) ((state) = (asan_user_state_t)((state) & ~ASAN_USER_STATE_TRACKED))
+
 uptr __asan_shadow_memory_dynamic_address;  // Global interface symbol.
 int __asan_option_detect_stack_use_after_return;  // Global interface symbol.
 uptr *__asan_test_only_reported_buggy_pointer;  // Used only for testing asan.
@@ -40,6 +59,10 @@ uptr *__asan_test_only_reported_buggy_pointer;  // Used only for testing asan.
 namespace __asan {
 
 uptr AsanMappingProfile[kAsanMappingProfileSize];
+
+// Forward declaration for user state function
+extern "C" const char* __asan_describe_state(asan_user_state_t state, char* buffer, size_t buffer_size);
+
 
 static void AsanDie() {
   static atomic_uint32_t num_calls;
@@ -156,16 +179,72 @@ void __asan_report_ ## type ## _n_noabort(uptr addr, uptr size) {           \
 ASAN_REPORT_ERROR_N(load, false)
 ASAN_REPORT_ERROR_N(store, true)
 
+// Fast user state access checking
+static inline bool FastCheckUserStateAccess(uptr addr, bool is_write) {
+    u8 shadow_value = *(volatile u8*)MemToShadow(addr);
+    
+    // Quick range check
+    if (shadow_value < ASAN_USER_STATE_SHADOW_BASE || 
+        shadow_value > ASAN_USER_STATE_SHADOW_MAX) {
+        return true;
+    }
+    
+    asan_user_state_t state = (asan_user_state_t)(shadow_value - ASAN_USER_STATE_SHADOW_BASE);
+    
+    // Bitwise checks - only check the basic requirements for now
+    if (!(state & ASAN_USER_ALLOCATED)) return false;
+    if (is_write && !(state & ASAN_USER_WRITABLE)) return false;
+    
+    return true;
+}
+
+// User state violation reporting
+static void ReportUserStateViolation(uptr addr, uptr access_size, bool is_write, u8 shadow_value) {
+    asan_user_state_t current_state = decode_user_state_from_shadow(shadow_value);
+    char state_desc[256];
+    __asan_describe_state(current_state, state_desc, sizeof(state_desc));
+    
+    Printf("ERROR: AddressSanitizer: user-state-violation on address %p\n", (void*)addr);
+    Printf("  %s of size %zu at %p\n", is_write ? "WRITE" : "READ", access_size, (void*)addr);
+    Printf("  Current memory state: %s (shadow=0x%02x)\n", state_desc, shadow_value);
+    
+    if (current_state == 0) {
+        Printf("  Violation: Accessing destroyed memory\n");
+    } else if (!(current_state & ASAN_USER_WRITABLE) && is_write) {
+        Printf("  Violation: Writing to read-only memory\n");
+    } else if (!(current_state & ASAN_USER_STATE_INITIALIZED)) {
+        Printf("  Violation: Accessing uninitialized memory\n");
+    } else if (current_state & ASAN_USER_RESERVED) {
+        Printf("  Violation: Accessing recycled memory\n");
+    }
+    
+    GET_STACK_TRACE_FATAL_HERE;
+    stack.Print();
+}
+
 #define ASAN_MEMORY_ACCESS_CALLBACK_BODY(type, is_write, size, exp_arg, fatal) \
-  uptr sp = MEM_TO_SHADOW(addr);                                               \
-  uptr s = size <= ASAN_SHADOW_GRANULARITY ? *reinterpret_cast<u8 *>(sp)       \
-                                           : *reinterpret_cast<u16 *>(sp);     \
-  if (UNLIKELY(s)) {                                                           \
-    if (UNLIKELY(size >= ASAN_SHADOW_GRANULARITY ||                            \
-                 ((s8)((addr & (ASAN_SHADOW_GRANULARITY - 1)) + size - 1)) >=  \
-                     (s8)s)) {                                                 \
-      ReportGenericErrorWrapper(addr, is_write, size, exp_arg, fatal);         \
-    }                                                                          \
+  /* User state detection */                                                \
+  if (ShouldCheckUserState() && !FastCheckUserStateAccess(addr, is_write)) { \
+    ReportUserStateViolation(addr, size, is_write, *(u8*)MemToShadow(addr)); \
+    return;                                                                 \
+  }                                                                          \
+                                                                             \
+  /* Original ASan detection logic - skip user state shadow bytes */        \
+  uptr sp = MEM_TO_SHADOW(addr);                                            \
+  u8 shadow_byte = *reinterpret_cast<u8 *>(sp);                             \
+  /* Skip user state shadow bytes (0x80-0x9F) */                             \
+  if (shadow_byte >= ASAN_USER_STATE_SHADOW_BASE &&                          \
+      shadow_byte <= ASAN_USER_STATE_SHADOW_MAX) {                           \
+    return;  /* Allow access to user-state-managed memory */                  \
+  }                                                                          \
+  uptr s = size <= ASAN_SHADOW_GRANULARITY ? shadow_byte                     \
+                                           : *reinterpret_cast<u16 *>(sp);    \
+  if (UNLIKELY(s)) {                                                         \
+    if (UNLIKELY(size >= ASAN_SHADOW_GRANULARITY ||                           \
+                 ((s8)((addr & (ASAN_SHADOW_GRANULARITY - 1)) + size - 1)) >= \
+                     (s8)s)) {                                                \
+      ReportGenericErrorWrapper(addr, is_write, size, exp_arg, fatal);        \
+    }                                                                        \
   }
 
 #define ASAN_MEMORY_ACCESS_CALLBACK(type, is_write, size)                      \
@@ -196,10 +275,27 @@ ASAN_MEMORY_ACCESS_CALLBACK(store, true, 16)
 extern "C"
 NOINLINE INTERFACE_ATTRIBUTE
 void __asan_loadN(uptr addr, uptr size) {
-  if ((addr = __asan_region_is_poisoned(addr, size))) {
-    GET_CALLER_PC_BP_SP;
-    ReportGenericError(pc, bp, sp, addr, false, size, 0, true);
-  }
+    /* User state detection */
+    if (ShouldCheckUserState()) {
+        if (!FastCheckUserStateAccess(addr, false) ||
+            !FastCheckUserStateAccess(addr + size - 1, false)) {
+            ReportUserStateViolation(addr, size, false, *(u8*)MemToShadow(addr));
+            return;
+        }
+        if (size > 16) {
+            const uptr stride = 1024;
+            for (uptr i = stride; i < size - 1; i += stride) {
+                if (!FastCheckUserStateAccess(addr + i, false)) {
+                    ReportUserStateViolation(addr + i, 1, false, *(u8*)MemToShadow(addr + i));
+                    return;
+                }
+            }
+        }
+    }
+    if ((addr = __asan_region_is_poisoned(addr, size))) {
+        GET_CALLER_PC_BP_SP;
+        ReportGenericError(pc, bp, sp, addr, false, size, 0, true);
+    }
 }
 
 extern "C"
@@ -223,10 +319,27 @@ void __asan_loadN_noabort(uptr addr, uptr size) {
 extern "C"
 NOINLINE INTERFACE_ATTRIBUTE
 void __asan_storeN(uptr addr, uptr size) {
-  if ((addr = __asan_region_is_poisoned(addr, size))) {
-    GET_CALLER_PC_BP_SP;
-    ReportGenericError(pc, bp, sp, addr, true, size, 0, true);
-  }
+    /* User state detection */
+    if (ShouldCheckUserState()) {
+        if (!FastCheckUserStateAccess(addr, true) ||
+            !FastCheckUserStateAccess(addr + size - 1, true)) {
+            ReportUserStateViolation(addr, size, true, *(u8*)MemToShadow(addr));
+            return;
+        }
+        if (size > 16) {
+            const uptr stride = 1024;
+            for (uptr i = stride; i < size - 1; i += stride) {
+                if (!FastCheckUserStateAccess(addr + i, true)) {
+                    ReportUserStateViolation(addr + i, 1, true, *(u8*)MemToShadow(addr + i));
+                    return;
+                }
+            }
+        }
+    }
+    if ((addr = __asan_region_is_poisoned(addr, size))) {
+        GET_CALLER_PC_BP_SP;
+        ReportGenericError(pc, bp, sp, addr, true, size, 0, true);
+    }
 }
 
 extern "C"
@@ -680,4 +793,131 @@ void __asan_init() {
 
 void __asan_version_mismatch_check() {
   // Do nothing.
+}
+
+// User state API implementations
+extern "C" INTERFACE_ATTRIBUTE void __asan_set_memory_state(void* addr, size_t size, asan_user_state_t state) {
+    if (size == 0) return;
+    uptr a = (uptr)addr;
+    u8 shadow_value = encode_user_state_to_shadow(state);
+    PoisonShadow(a, RoundUpTo(size, ASAN_SHADOW_GRANULARITY), shadow_value);
+}
+
+extern "C" INTERFACE_ATTRIBUTE asan_user_state_t __asan_get_memory_state(void* addr) {
+    uptr a = (uptr)addr;
+    u8* shadow_addr = (u8*)MemToShadow(a);
+    u8 shadow_value = *shadow_addr;
+    return decode_user_state_from_shadow(shadow_value);
+}
+
+extern "C" INTERFACE_ATTRIBUTE int __asan_memory_has_state(void* addr, size_t size, asan_user_state_t state) {
+    uptr a = (uptr)addr;
+    u8 expected_shadow = encode_user_state_to_shadow(state);
+    
+    for (uptr i = 0; i < size; ++i) {
+        u8* shadow_addr = (u8*)MemToShadow(a + i);
+        if (*shadow_addr != expected_shadow) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
+// State transition functions
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_allocated(void* addr, size_t size) {
+    __asan_set_memory_state(addr, size, ASAN_USER_ALLOCATED);
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_destroyed(void* addr, size_t size) {
+    __asan_set_memory_state(addr, size, (asan_user_state_t)0);
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_initialized(void* addr, size_t size) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    ASAN_SET_INITIALIZED(state);
+    __asan_set_memory_state(addr, size, state);
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_recycled(void* addr, size_t size) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    ASAN_SET_RECYCLED(state);
+    __asan_set_memory_state(addr, size, state);
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_writable(void* addr, size_t size) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    ASAN_SET_WRITABLE(state);
+    __asan_set_memory_state(addr, size, state);
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_readonly(void* addr, size_t size) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    ASAN_SET_READONLY(state);
+    __asan_set_memory_state(addr, size, state);
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_tracked(void* addr, size_t size) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    ASAN_SET_TRACKED(state);
+    __asan_set_memory_state(addr, size, state);
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_mark_untracked(void* addr, size_t size) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    ASAN_SET_NOT_TRACKED(state);
+    __asan_set_memory_state(addr, size, state);
+}
+
+extern "C" INTERFACE_ATTRIBUTE const char* __asan_describe_state(asan_user_state_t state, char* buffer, size_t buffer_size) {
+    const char* lifecycle = ASAN_IS_ALLOCATED(state) ? "Allocated" : "Destroyed";
+    const char* init = ASAN_IS_INITIALIZED(state) ? "Initialized" : "Uninitialized";
+    const char* recycle = ASAN_IS_RECYCLED(state) ? "Recycled" : "Active";
+    const char* access = ASAN_IS_WRITABLE(state) ? "Writable" : "ReadOnly";
+    const char* track = ASAN_IS_TRACKED(state) ? "Tracked" : "NotTracked";
+    
+    internal_snprintf(buffer, buffer_size, 
+             "Lifecycle:%s, Init:%s, Recycle:%s, Access:%s, Track:%s",
+             lifecycle, init, recycle, access, track);
+    return buffer;
+}
+
+extern "C" INTERFACE_ATTRIBUTE void __asan_set_detect_user_state(int enabled) {
+    SetUserStateDetectionEnabled(enabled != 0);
+}
+
+// Convenience state query functions
+extern "C" INTERFACE_ATTRIBUTE int __asan_is_allocated(void* addr) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    return ASAN_IS_ALLOCATED(state) ? 1 : 0;
+}
+
+extern "C" INTERFACE_ATTRIBUTE int __asan_is_destroyed(void* addr) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    return ASAN_IS_DESTROYED(state) ? 1 : 0;
+}
+
+extern "C" INTERFACE_ATTRIBUTE int __asan_is_initialized(void* addr) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    return ASAN_IS_INITIALIZED(state) ? 1 : 0;
+}
+
+extern "C" INTERFACE_ATTRIBUTE int __asan_is_recycled(void* addr) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    return ASAN_IS_RECYCLED(state) ? 1 : 0;
+}
+
+extern "C" INTERFACE_ATTRIBUTE int __asan_is_writable(void* addr) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    return ASAN_IS_WRITABLE(state) ? 1 : 0;
+}
+
+extern "C" INTERFACE_ATTRIBUTE int __asan_is_readonly(void* addr) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    return ASAN_IS_READONLY(state) ? 1 : 0;
+}
+
+extern "C" INTERFACE_ATTRIBUTE int __asan_is_tracked(void* addr) {
+    asan_user_state_t state = __asan_get_memory_state(addr);
+    return ASAN_IS_TRACKED(state) ? 1 : 0;
 }

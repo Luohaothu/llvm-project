@@ -43,6 +43,10 @@ inline Flags *flags() {
 
 void InitializeFlags();
 
+// User state detection control
+void SetUserStateDetectionEnabled(bool enabled);
+bool ShouldCheckUserState();
+
 }  // namespace __asan
 
 #endif  // ASAN_FLAGS_H

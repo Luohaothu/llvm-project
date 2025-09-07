@@ -333,6 +333,86 @@ void SANITIZER_CDECL __asan_handle_no_return(void);
 /// trace. Returns 1 if successful, 0 if not.
 int SANITIZER_CDECL __asan_update_allocation_context(void *addr);
 
+// User-defined memory state flags
+typedef enum {
+    ASAN_USER_ALLOCATED = 0x01,    // 0=destroyed, 1=allocated
+    ASAN_USER_STATE_INITIALIZED = 0x02,  // 0=uninitialized, 1=initialized
+    ASAN_USER_RESERVED = 0x04,      // 0=not recycled, 1=recycled
+    ASAN_USER_WRITABLE = 0x08,      // 0=read-only, 1=writable
+    ASAN_USER_STATE_TRACKED = 0x10, // 0=not tracked, 1=tracked
+    ASAN_USER_STATE_RESERVED1 = 0x20,
+    ASAN_USER_STATE_RESERVED2 = 0x40,
+    ASAN_USER_STATE_RESERVED3 = 0x80
+} asan_user_state_t;
+
+// State checking macros
+#define ASAN_IS_ALLOCATED(state) ((state) & ASAN_USER_ALLOCATED)
+#define ASAN_IS_DESTROYED(state) (!((state) & ASAN_USER_ALLOCATED))
+#define ASAN_IS_INITIALIZED(state) ((state) & ASAN_USER_STATE_INITIALIZED)
+#define ASAN_IS_UNINITIALIZED(state) (!((state) & ASAN_USER_STATE_INITIALIZED))
+#define ASAN_IS_RECYCLED(state) ((state) & ASAN_USER_RESERVED)
+#define ASAN_IS_NOT_RECYCLED(state) (!((state) & ASAN_USER_RESERVED))
+#define ASAN_IS_WRITABLE(state) ((state) & ASAN_USER_WRITABLE)
+#define ASAN_IS_READONLY(state) (!((state) & ASAN_USER_WRITABLE))
+#define ASAN_IS_TRACKED(state) ((state) & ASAN_USER_STATE_TRACKED)
+#define ASAN_IS_NOT_TRACKED(state) (!((state) & ASAN_USER_STATE_TRACKED))
+
+// State setting macros
+#define ASAN_SET_ALLOCATED(state) ((state) |= ASAN_USER_ALLOCATED)
+#define ASAN_SET_DESTROYED(state) ((state) &= ~ASAN_USER_ALLOCATED)
+#define ASAN_SET_INITIALIZED(state) ((state) |= ASAN_USER_STATE_INITIALIZED)
+#define ASAN_SET_UNINITIALIZED(state) ((state) &= ~ASAN_USER_STATE_INITIALIZED)
+#define ASAN_SET_RECYCLED(state) ((state) |= ASAN_USER_RESERVED)
+#define ASAN_SET_NOT_RECYCLED(state) ((state) &= ~ASAN_USER_RESERVED)
+#define ASAN_SET_WRITABLE(state) ((state) |= ASAN_USER_WRITABLE)
+#define ASAN_SET_READONLY(state) ((state) &= ~ASAN_USER_WRITABLE)
+#define ASAN_SET_TRACKED(state) ((state) |= ASAN_USER_STATE_TRACKED)
+#define ASAN_SET_NOT_TRACKED(state) ((state) &= ~ASAN_USER_STATE_TRACKED)
+
+// Predefined state combinations
+#define ASAN_STATE_FRESH_ALLOC (ASAN_USER_ALLOCATED)
+#define ASAN_STATE_UNINIT (ASAN_USER_ALLOCATED | ASAN_USER_WRITABLE)
+#define ASAN_STATE_READY_RW (ASAN_USER_ALLOCATED | ASAN_USER_STATE_INITIALIZED | ASAN_USER_WRITABLE)
+#define ASAN_STATE_READY_RO (ASAN_USER_ALLOCATED | ASAN_USER_STATE_INITIALIZED)
+#define ASAN_STATE_RECYCLED (ASAN_USER_ALLOCATED | ASAN_USER_RESERVED)
+#define ASAN_STATE_DEAD (0x00)
+#define ASAN_STATE_TRACKED_RW (ASAN_STATE_READY_RW | ASAN_USER_STATE_TRACKED)
+
+// User state shadow memory mapping
+#define ASAN_USER_STATE_SHADOW_BASE 0x80
+#define ASAN_USER_STATE_SHADOW_MAX 0x9F
+
+// User state API functions
+    // Basic state operations
+    void SANITIZER_CDECL __asan_set_memory_state(void* addr, size_t size, asan_user_state_t state);
+    asan_user_state_t SANITIZER_CDECL __asan_get_memory_state(void* addr);
+    int SANITIZER_CDECL __asan_memory_has_state(void* addr, size_t size, asan_user_state_t state);
+    
+    // Convenience state query functions
+    int SANITIZER_CDECL __asan_is_allocated(void* addr);
+    int SANITIZER_CDECL __asan_is_destroyed(void* addr);
+    int SANITIZER_CDECL __asan_is_initialized(void* addr);
+    int SANITIZER_CDECL __asan_is_recycled(void* addr);
+    int SANITIZER_CDECL __asan_is_writable(void* addr);
+    int SANITIZER_CDECL __asan_is_readonly(void* addr);
+    int SANITIZER_CDECL __asan_is_tracked(void* addr);
+    
+    // State transition functions
+    void SANITIZER_CDECL __asan_mark_allocated(void* addr, size_t size);
+    void SANITIZER_CDECL __asan_mark_destroyed(void* addr, size_t size);
+    void SANITIZER_CDECL __asan_mark_initialized(void* addr, size_t size);
+    void SANITIZER_CDECL __asan_mark_recycled(void* addr, size_t size);
+    void SANITIZER_CDECL __asan_mark_writable(void* addr, size_t size);
+    void SANITIZER_CDECL __asan_mark_readonly(void* addr, size_t size);
+    void SANITIZER_CDECL __asan_mark_tracked(void* addr, size_t size);
+    void SANITIZER_CDECL __asan_mark_untracked(void* addr, size_t size);
+    
+    // State description (for debugging)
+    const char* SANITIZER_CDECL __asan_describe_state(asan_user_state_t state, char* buffer, size_t buffer_size);
+    
+    // Runtime control
+    void SANITIZER_CDECL __asan_set_detect_user_state(int enabled);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
